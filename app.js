@@ -221,9 +221,28 @@ async function apiCore(a, { method = 'GET', body = {}, q = {} } = {}) {
     case 'me': await restore(); return { csrf: '', user: PK ? meJson() : null, unread: 0 };
     case 'ogp': return { ogp: null }; // 静的サイトのためリンクプレビューは無効
     case 'timeline': {
-      const f = { kinds: [1], limit: 100 };
+      const f = { kinds: [1, 6], limit: 150 };
       if (b.scope === 'following') { const a2 = [PK, ...following()]; if (a2.length > 1) f.authors = a2; else return { posts: [] }; }
-      return { posts: await decorate((await qf(f)).filter(isTop)) };
+      const raw = await qf(f);
+      // 元ポストID -> { ev: 元ポスト, ts: タイムライン上の並び順の時刻, by: リポストした人 }
+      const items = new Map();
+      const put = (ev, ts, by) => { const o = items.get(ev.id); if (!o || o.ts < ts) items.set(ev.id, { ev, ts, by }); };
+      const okEv = (o) => { try { return !!o && o.kind === 1 && (NT.verifyEvent ? NT.verifyEvent(o) : true); } catch (_) { return false; } };
+      const need = [];
+      for (const e of raw) {
+        if (e.kind === 1) { if (isTop(e)) put(e, e.created_at, ''); continue; }
+        if (e.kind !== 6) continue;
+        const id = e.tags.find((t) => t[0] === 'e')?.[1]; if (!id) continue;
+        let o = null; try { o = JSON.parse(e.content); } catch (_) {}
+        if (o && o.id === id && okEv(o)) put(o, e.created_at, e.pubkey); // 本文入りリポストはそのまま使う
+        else need.push([id, e]);                                          // 本文が空なら元ポストを取得する
+      }
+      if (need.length) {
+        const m = new Map((await qf({ ids: [...new Set(need.map((n) => n[0]))] })).map((x) => [x.id, x]));
+        for (const [id, e] of need) { const o = m.get(id); if (o && o.kind === 1) put(o, e.created_at, e.pubkey); }
+      }
+      const [posts] = await Promise.all([decorate([...items.values()].map((x) => x.ev)), profiles([...items.values()].map((x) => x.by).filter(Boolean))]);
+      return { posts: posts.map((p) => { const m = items.get(p.id); return { ...p, rtBy: m.by ? { ...uJson(m.by), mine: m.by === PK } : null, _s: m.ts }; }).sort((a, b) => b._s - a._s) };
     }
     case 'thread': {
       const [e] = await qf({ ids: [b.id] }); if (!e) throw new Error('ポストが見つかりません');
@@ -372,6 +391,7 @@ const rxChips = (p) => { const ks = Object.keys(p.rx || {}).sort((a, b) => p.rx[
 function postHtml(p) {
   return `<article class="post" data-id="${p.id}"><a class="avatar" href="#/profile/${p.handle}">${av(p)}</a>
     <div class="content">
+      ${p.rtBy ? `<div class="rt-by"><i class="fa-solid fa-retweet"></i>${p.rtBy.mine ? 'あなた' : `<a href="#/profile/${p.rtBy.handle}">${esc(p.rtBy.name)}</a>さん`}がリポスト</div>` : ''}
       <div class="header"><a class="name" href="#/profile/${p.handle}">${esc(p.name)}</a><span class="username">@${sh(p.handle)}</span><a class="time" href="#/post/${p.id}">· ${ago(p.ts)}</a>
         ${p.mine ? `<button class="btn-del" data-act="del" data-id="${p.id}" aria-label="削除"><i class="fa-regular fa-trash-can"></i></button>` : ''}</div>
       <p class="text">${rich(p.body, p.emojis)}</p>${ogpSlot(p.body)}${rxChips(p)}
