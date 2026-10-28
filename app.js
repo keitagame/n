@@ -51,6 +51,39 @@ async function hydrateOgp() {
   await Promise.all([worker(), worker(), worker()]);
 }
 
+/* ---------- 上部プログレスバー ---------- */
+const Prog = (() => {
+  const wrap = document.getElementById('topbar'), bar = wrap && wrap.firstElementChild;
+  let n = 0, v = 0, tick = 0, fin = 0, hide = 0;
+  const paint = () => { if (bar) bar.style.transform = `scaleX(${v})`; };
+  const start = () => {
+    n++; clearTimeout(fin);
+    if (!wrap || tick) return;
+    clearTimeout(hide);
+    wrap.style.transition = bar.style.transition = 'none';   // 0%に即リセット
+    v = 0; paint(); wrap.style.opacity = 1;
+    void wrap.offsetWidth;
+    wrap.style.transition = bar.style.transition = '';
+    v = 0.08; paint();
+    tick = setInterval(() => { v += (0.92 - v) * 0.04; paint(); }, 200); // 待っている間じわじわ進む
+  };
+  const finish = () => {
+    if (n > 0) return;
+    clearInterval(tick); tick = 0;
+    v = 1; paint();
+    hide = setTimeout(() => { wrap.style.opacity = 0; }, 250);
+  };
+  const end = () => {
+    if (n > 0) n--;
+    if (!wrap || !tick) return;
+    v += (0.92 - v) * 0.2; paint();                          // 1件完了するごとに前進
+    if (n === 0) fin = setTimeout(finish, 150);              // 直列処理の継ぎ目でちらつかないよう少し待つ
+  };
+  // Promiseの開始〜完了をバーに反映する(結果はそのまま返す)
+  const track = (p) => { start(); p.then(end, end); return p; };
+  return { track };
+})();
+
 /* ===== ℕ : Nostr レイヤー (api.php の代替) ===== */
 const NT = window.NostrTools;
 const RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.nostr.band', 'wss://yabu.me'];
@@ -62,7 +95,7 @@ const h2u = (h) => Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
 const npubOf = (pk) => NT.nip19.npubEncode(pk);
 const pkOf = (h) => { h = String(h || ''); if (/^[0-9a-f]{64}$/.test(h)) return h; try { const d = NT.nip19.decode(h); return d.type === 'npub' ? d.data : d.type === 'nprofile' ? d.data.pubkey : ''; } catch (_) { return ''; } };
 let SK = null, PK = '', EVC = new Map(), PROF = new Map(), CONTACTS = null, BM = null, LIKES = new Map(), RTS = new Map();
-const qf = (f, relays = RELAYS, w = 4000) => pool.querySync(relays, f, { maxWait: w }).catch(() => []);
+const qf = (f, relays = RELAYS, w = 4000) => Prog.track(pool.querySync(relays, f, { maxWait: w }).catch(() => []));
 async function signEv(kind, content, tags = []) {
   const t = { kind, content, tags, created_at: now() };
   return SK ? NT.finalizeEvent(t, SK) : window.nostr.signEvent(t);
@@ -135,7 +168,9 @@ async function restore() {
 }
 const meJson = () => { const u = uJson(PK); return { handle: u.handle, name: u.name, bio: u.bio, avatar: u.avatar, banner: u.banner, pubkey: PK }; };
 
-async function api(a, { method = 'GET', body = {}, q = {} } = {}) {
+// 通信を伴う操作(ポスト・いいね等)もバーに反映。me/ogpは通信しない/常時走るので除外
+function api(a, o) { const r = apiCore(a, o); return (a === 'me' || a === 'ogp') ? r : Prog.track(r); }
+async function apiCore(a, { method = 'GET', body = {}, q = {} } = {}) {
   const b = method === 'POST' ? body : q;
   const need = !['me', 'ogp'].includes(a);
   if (need && !PK) throw Object.assign(new Error('ログインが必要です'), {});
@@ -389,7 +424,8 @@ async function followList(h, kind) {
 }
 
 /* ---------- ルーター ---------- */
-async function render(fresh) {
+function render(fresh) { return Prog.track(renderCore(fresh)); }
+async function renderCore(fresh) {
   const parts = location.hash.replace(/^#\/?/, '').split('/');
   let name = parts[0] || 'home';
   const arg = decodeURIComponent(parts.slice(1).join('/'));

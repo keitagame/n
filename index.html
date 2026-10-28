@@ -792,9 +792,28 @@ body.guest .main-content { max-width: 440px; margin: 0 auto; }
   .ogp:hover { background: rgba(231, 233, 234, 0.06); }
   .ogp-site, .ogp-desc { color: #71767b; }
 }
+
+/* ===== 上部プログレスバー ===== */
+#topbar {
+  position: fixed; top: env(safe-area-inset-top, 0px); left: 0; right: 0;
+  height: 3px; z-index: 1000; pointer-events: none;
+  opacity: 0; transition: opacity 0.3s ease;
+}
+#topbar > div {
+  height: 100%; background: #1d9bf0; border-radius: 0 3px 3px 0;
+  transform: scaleX(0); transform-origin: left center;
+  transition: transform 0.25s ease-out;
+  box-shadow: 0 0 8px rgba(29, 155, 240, 0.6);
+}
+@media (prefers-reduced-motion: reduce) {
+  #topbar, #topbar > div { transition: none; }
+}
 </style>
 </head>
 <body>
+
+<!-- 読み込み進行バー -->
+<div id="topbar" aria-hidden="true"><div></div></div>
 
 <div class="layout-container">
 
