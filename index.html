@@ -808,6 +808,66 @@ body.guest .main-content { max-width: 440px; margin: 0 auto; }
 @media (prefers-reduced-motion: reduce) {
   #topbar, #topbar > div { transition: none; }
 }
+
+/* ===== リアクション ===== */
+.rx-list { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 8px; }
+.rx-chip {
+  display: inline-flex; align-items: center; gap: 5px; padding: 2px 10px;
+  border-radius: 9999px; border: 1px solid #cfd9de; background: transparent; color: #536471;
+  font: inherit; font-size: 13px; line-height: 22px; cursor: pointer;
+  transition: background-color 0.15s, border-color 0.15s;
+}
+.rx-chip span:first-child { font-size: 15px; }
+.rx-chip:hover { background: rgba(29, 155, 240, 0.08); }
+.rx-chip.on { border-color: #1d9bf0; background: rgba(29, 155, 240, 0.12); color: #1d9bf0; font-weight: 700; }
+.actions button.react:hover, .actions button.on.react { color: #ffad1f; }
+.notif .ico.react { color: #ffad1f; }
+#rx-pick {
+  position: fixed; z-index: 60; display: flex; flex-wrap: wrap; gap: 2px; padding: 6px;
+  background: #fff; border: 1px solid #cfd9de; border-radius: 9999px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18); max-width: calc(100vw - 16px);
+}
+#rx-pick[hidden] { display: none; }
+#rx-pick button {
+  width: 38px; height: 38px; padding: 0; border: none; border-radius: 50%;
+  background: none; font-size: 22px; cursor: pointer; transition: transform 0.12s, background-color 0.12s;
+}
+#rx-pick button:hover { background: rgba(0, 0, 0, 0.06); transform: scale(1.2); }
+#rx-pick button.on { background: rgba(29, 155, 240, 0.15); }
+
+.cemoji { height: 1.3em; width: auto; max-width: 4em; vertical-align: -0.3em; display: inline-block; object-fit: contain; }
+.rx-chip .cemoji { height: 18px; vertical-align: middle; }
+
+/* ===== 閲覧者(ポスト詳細) ===== */
+.viewers {
+  display: flex; align-items: center; gap: 8px; padding: 10px 16px; min-width: 0;
+  border-bottom: 1px solid #e5e7eb; border-right: 1px solid #e5e7eb;
+  font-size: 13px; color: #536471;
+}
+.viewers .vlabel { flex-shrink: 0; }
+.viewers .vlist { display: flex; padding-left: 6px; min-width: 0; flex-wrap: wrap; }
+.vw {
+  width: 24px; height: 24px; margin-left: -6px; border-radius: 50%; overflow: hidden; flex-shrink: 0;
+  display: inline-flex; border: 2px solid #fff; background: #cfd9de;
+}
+.vw:hover { position: relative; z-index: 1; transform: scale(1.15); }
+.vw img, .vw .ph { width: 100%; height: 100%; object-fit: cover; border-radius: 50%; }
+.vw .ph { display: flex; align-items: center; justify-content: center; color: #fff; font-size: 11px; font-weight: 700; }
+.viewers .vmore, .viewers .vcount { flex-shrink: 0; }
+.viewers .vtoggle {
+  margin-left: auto; flex-shrink: 0; background: none; border: none; padding: 2px 6px;
+  color: inherit; font: inherit; font-size: 12px; cursor: pointer; text-decoration: underline;
+}
+.viewers .vtoggle:hover { color: #1d9bf0; }
+@media (max-width: 600px) { .viewers { border-right: none; } }
+@media (prefers-color-scheme: dark) {
+  .rx-chip { border-color: #38444d; color: #71767b; }
+  .rx-chip.on { border-color: #1d9bf0; color: #1d9bf0; }
+  #rx-pick { background: #16181c; border-color: #2f3336; }
+  #rx-pick button:hover { background: rgba(231, 233, 234, 0.1); }
+  .viewers { border-color: #2f3336; color: #71767b; }
+  .vw { border-color: #000; background: #333639; }
+}
 </style>
 </head>
 <body>

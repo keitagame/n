@@ -15,14 +15,17 @@ const richText = (s) => esc(s)
   .replace(/nostr:(npub1[a-z0-9]{58})/g, (m, n) => `<a href="#/profile/${n}">@${n.slice(0, 10)}…</a>`)
   .replace(/(^|\s)@([A-Za-z0-9_]{3,15})/g, '$1<a href="#/profile/$2">@$2</a>')
   .replace(/(^|\s)#([\p{L}\p{N}_]+)/gu, (m, p, t) => `${p}<a href="#/search/${encodeURIComponent('#' + t)}">#${t}</a>`);
-const rich = (s) => {
+const emojify = (html, em) => em && Object.keys(em).length
+  ? html.replace(/(<[^>]*>)|:([A-Za-z0-9_]{1,40}):/g, (m, tag, n) => tag ? tag : em[n] ? `<img class="cemoji" src="${esc(em[n])}" alt=":${n}:" title=":${n}:" loading="lazy" referrerpolicy="no-referrer">` : m)
+  : html;
+const rich = (s, em) => {
   s = String(s); let out = '', i = 0;
   for (const m of s.matchAll(URL_RE)) {
     const u = trimUrl(m[0]);
     out += richText(s.slice(i, m.index)) + `<a href="${esc(u)}" target="_blank" rel="noopener noreferrer nofollow ugc">${esc(linkText(u))}</a>`;
     i = m.index + u.length;
   }
-  return out + richText(s.slice(i));
+  return emojify(out + richText(s.slice(i)), em);
 };
 const hue = (s) => Math.abs([...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7)) % 360;
 const imgUrl = (f) => f;
@@ -94,7 +97,7 @@ const now = () => Math.floor(Date.now() / 1000);
 const h2u = (h) => Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
 const npubOf = (pk) => NT.nip19.npubEncode(pk);
 const pkOf = (h) => { h = String(h || ''); if (/^[0-9a-f]{64}$/.test(h)) return h; try { const d = NT.nip19.decode(h); return d.type === 'npub' ? d.data : d.type === 'nprofile' ? d.data.pubkey : ''; } catch (_) { return ''; } };
-let SK = null, PK = '', EVC = new Map(), PROF = new Map(), CONTACTS = null, BM = null, LIKES = new Map(), RTS = new Map();
+let SK = null, PK = '', EVC = new Map(), PROF = new Map(), CONTACTS = null, BM = null, LIKES = new Map(), RTS = new Map(), MYR = new Map();
 const qf = (f, relays = RELAYS, w = 4000) => Prog.track(pool.querySync(relays, f, { maxWait: w }).catch(() => []));
 async function signEv(kind, content, tags = []) {
   const t = { kind, content, tags, created_at: now() };
@@ -114,6 +117,16 @@ async function profiles(pks) {
 }
 const uJson = (pk) => { const p = PROF.get(pk) || {}; const n = npubOf(pk);
   return { pubkey: pk, handle: n, name: p.display_name || p.name || sh(n), bio: p.about || '', avatar: /^https?:/.test(p.picture || '') ? p.picture : null, banner: /^https?:/.test(p.banner || '') ? p.banner : null }; };
+// リアクション(NIP-25): 空・'+'・❤ はいいね、'-' と :custom: は無視、それ以外は絵文字リアクション
+const safeUrl = (u) => /^https:\/\/[^\s"'<>]+$/.test(u || '');
+const CEMOJI = new Map(); // ':name:' -> 画像URL (NIP-30 カスタム絵文字)
+const emojiMap = (tags) => { const o = {}; for (const t of tags) if (t[0] === 'emoji' && /^[A-Za-z0-9_]{1,40}$/.test(t[1] || '') && safeUrl(t[2])) o[t[1]] = t[2]; return o; };
+const rxOf = (c) => { c = String(c || '').trim(); if (c === '' || c === '+' || /^[❤♥]\uFE0F?$/u.test(c)) return '+'; if (/^:[A-Za-z0-9_]{1,40}:$/.test(c)) return c; if (c === '-' || c[0] === ':' || c.length > 16) return null; return c; };
+// イベントからリアクション種別を得る。カスタム絵文字は画像URLが無ければ無視し、あれば登録する
+const rxEv = (s) => { const r = rxOf(s.content); if (!r || r === '+' || r[0] !== ':') return r;
+  const u = emojiMap(s.tags)[r.slice(1, -1)]; if (!u) return null; if (!CEMOJI.has(r)) CEMOJI.set(r, u); return r; };
+const RX_SET = ['👍', '😂', '😮', '😢', '🔥', '🎉', '🙏', '👀'];
+const eTarget = (e) => [...e.tags].reverse().find((t) => t[0] === 'e')?.[1];
 const parentOf = (e) => { const t = e.tags.filter((x) => x[0] === 'e'); if (!t.length) return null; return (t.find((x) => x[3] === 'reply') || t[t.length - 1])[1]; };
 
 async function decorate(evs, order = 'desc') {
@@ -122,21 +135,31 @@ async function decorate(evs, order = 'desc') {
   if (!evs.length) return [];
   const ids = evs.map((e) => e.id);
   const [, st] = await Promise.all([profiles(evs.map((e) => e.pubkey)), qf({ kinds: [1, 6, 7], '#e': ids, limit: 2000 })]);
-  const c = {}; const bump = (id, k) => { (c[id] ||= { rep: 0, rt: 0, likes: 0 })[k]++; };
+  const c = {}; const slot = (id) => (c[id] ||= { rep: 0, rt: 0, likes: 0, rx: {} }); const bump = (id, k) => { slot(id)[k]++; };
+  const seenRx = new Set();
   for (const s of st) {
-    if (s.kind === 7) { const id = [...s.tags].reverse().find((t) => t[0] === 'e')?.[1]; if (id && s.content !== '-') bump(id, 'likes'); }
+    if (s.kind === 7) {
+      const id = eTarget(s), r = rxEv(s), key = `${s.pubkey}|${id}|${r}`;
+      if (!id || r === null || seenRx.has(key)) continue; // 同じ人の同じリアクションは1回だけ数える
+      seenRx.add(key);
+      if (r === '+') bump(id, 'likes'); else { const o = slot(id); o.rx[r] = (o.rx[r] || 0) + 1; }
+    }
     else if (s.kind === 6) { const id = s.tags.find((t) => t[0] === 'e')?.[1]; if (id) bump(id, 'rt'); }
     else { const id = parentOf(s); if (id) bump(id, 'rep'); }
   }
   return evs.map((e) => ({ ...uJson(e.pubkey), id: e.id, body: e.content, ts: e.created_at, parent_id: parentOf(e),
-    rep: c[e.id]?.rep || 0, rt: c[e.id]?.rt || 0, likes: c[e.id]?.likes || 0,
+    rep: c[e.id]?.rep || 0, rt: c[e.id]?.rt || 0, likes: c[e.id]?.likes || 0, emojis: emojiMap(e.tags), rx: c[e.id]?.rx || {}, myrx: [...(MYR.get(e.id)?.keys() || [])],
     liked: LIKES.has(e.id), reposted: RTS.has(e.id), bookmarked: !!BM && BM.tags.some((t) => t[0] === 'e' && t[1] === e.id), mine: e.pubkey === PK }));
 }
 async function loadMine() {
   const [c, b, l, r] = await Promise.all([qf({ kinds: [3], authors: [PK], limit: 1 }), qf({ kinds: [10003], authors: [PK], limit: 1 }), qf({ kinds: [7], authors: [PK], limit: 500 }), qf({ kinds: [6], authors: [PK], limit: 500 })]);
   const last = (a) => a.sort((x, y) => y.created_at - x.created_at)[0] || null;
   CONTACTS = last(c) || { content: '', tags: [] }; BM = last(b) || { content: '', tags: [] };
-  LIKES = new Map(l.map((e) => [[...e.tags].reverse().find((t) => t[0] === 'e')?.[1], e.id]).filter((x) => x[0]));
+  LIKES = new Map(); MYR = new Map();
+  for (const e of l.sort((x, y) => x.created_at - y.created_at)) {
+    const id = eTarget(e), r = rxEv(e); if (!id || r === null) continue;
+    if (r === '+') LIKES.set(id, e.id); else { if (!MYR.has(id)) MYR.set(id, new Map()); MYR.get(id).set(r, e.id); }
+  }
   RTS = new Map(r.map((e) => [e.tags.find((t) => t[0] === 'e')?.[1], e.id]).filter((x) => x[0]));
   await profiles([PK]);
 }
@@ -144,6 +167,26 @@ const following = () => CONTACTS.tags.filter((t) => t[0] === 'p').map((t) => t[1
 const isTop = (e) => !e.tags.some((t) => t[0] === 'e');
 const userRows = async (pks) => { await profiles(pks); const f = new Set(following()); return pks.map((p) => ({ ...uJson(p), following: f.has(p), mine: p === PK })); };
 const forget = (kind, id) => pub(5, '', [['e', id], ['k', String(kind)]]);
+
+/* ---------- 閲覧者(ポスト詳細を開いた人) ----------
+   Nostrに閲覧記録の仕組みは無いため、詳細を開いた人が kind 30078 (アプリ固有データ/置換可能イベント) を
+   「n-view:<ポストID>」として公開し、それを集めて表示する。1人1ポストにつき1イベントのみ保持される。 */
+const VIEW_KIND = 30078, viewTag = (id) => 'n-view:' + id;
+const noView = () => { try { return localStorage.getItem('n_noview') === '1'; } catch (_) { return false; } };
+async function loadViewers(e) {
+  const evs = (await qf({ kinds: [VIEW_KIND], '#e': [e.id], limit: 200 })).filter((x) => x.tags.some((t) => t[0] === 'd' && t[1] === viewTag(e.id)));
+  const m = new Map();
+  for (const x of evs) if (!m.has(x.pubkey) || m.get(x.pubkey) < x.created_at) m.set(x.pubkey, x.created_at);
+  // 自分の閲覧を記録(秘密鍵ログイン時のみ。NIP-07だと閲覧のたびに署名確認が出るため記録しない)
+  if (SK && PK && e.pubkey !== PK && !noView() && !m.has(PK)) {
+    m.set(PK, now());
+    pub(VIEW_KIND, '', [['d', viewTag(e.id)], ['e', e.id]]).catch(() => {});
+  }
+  m.delete(e.pubkey); // 投稿者本人は除く
+  const pks = [...m.keys()].sort((a, b) => m.get(b) - m.get(a));
+  await profiles(pks);
+  return pks.map(uJson);
+}
 
 function startSession(sk, nip07) {
   SK = sk; PK = sk ? NT.getPublicKey(sk) : '';
@@ -185,7 +228,8 @@ async function apiCore(a, { method = 'GET', body = {}, q = {} } = {}) {
     case 'thread': {
       const [e] = await qf({ ids: [b.id] }); if (!e) throw new Error('ポストが見つかりません');
       const rs = (await qf({ kinds: [1], '#e': [b.id] })).filter((x) => parentOf(x) === b.id);
-      const [post] = await decorate([e]); return { post, replies: await decorate(rs, 'asc') };
+      const [[post], replies, viewers] = await Promise.all([decorate([e]), decorate(rs, 'asc'), loadViewers(e).catch(() => [])]);
+      return { post, replies, viewers, canRecord: !!SK, noview: noView() };
     }
     case 'post': {
       const tags = []; const t = String(b.body);
@@ -199,6 +243,15 @@ async function apiCore(a, { method = 'GET', body = {}, q = {} } = {}) {
       if (LIKES.has(b.id)) { await forget(7, LIKES.get(b.id)); LIKES.delete(b.id); return { on: false }; }
       const pe = EVC.get(b.id) || (await qf({ ids: [b.id] }))[0];
       const ev = await pub(7, '+', [['e', b.id], ...(pe ? [['p', pe.pubkey]] : [])]); LIKES.set(b.id, ev.id); return { on: true };
+    }
+    case 'react': { // 絵文字リアクションのON/OFF(同じ絵文字をもう一度押すと取り消し)
+      const r = rxOf(b.emoji); if (!r || r === '+') throw new Error('このリアクションは使えません');
+      const m = MYR.get(b.id) || new Map();
+      if (m.has(r)) { await forget(7, m.get(r)); m.delete(r); return { on: false }; }
+      const pe = EVC.get(b.id) || (await qf({ ids: [b.id] }))[0];
+      const custom = r[0] === ':'; if (custom && !CEMOJI.has(r)) throw new Error('このリアクションは使えません');
+      const ev = await pub(7, r, [['e', b.id], ...(pe ? [['p', pe.pubkey]] : []), ['k', '1'], ...(custom ? [['emoji', r.slice(1, -1), CEMOJI.get(r)]] : [])]);
+      m.set(r, ev.id); MYR.set(b.id, m); return { on: true };
     }
     case 'repost': {
       if (RTS.has(b.id)) { await forget(6, RTS.get(b.id)); RTS.delete(b.id); return { on: false }; }
@@ -258,11 +311,11 @@ async function apiCore(a, { method = 'GET', body = {}, q = {} } = {}) {
       return { trends: Object.entries(c).sort((x, y) => y[1] - x[1]).slice(0, 5).map(([t, n]) => ({ tag: '#' + t, count: n })), users: [] };
     }
     case 'notifs': {
-      const evs = (await qf({ kinds: [1, 6, 7, 3], '#p': [PK], limit: 60 })).filter((e) => e.pubkey !== PK).sort((x, y) => y.created_at - x.created_at).slice(0, 50);
+      const evs = (await qf({ kinds: [1, 6, 7, 3], '#p': [PK], limit: 60 })).filter((e) => e.pubkey !== PK && (e.kind !== 7 || rxEv(e) !== null)).sort((x, y) => y.created_at - x.created_at).slice(0, 50);
       await profiles(evs.map((e) => e.pubkey));
       const items = evs.map((e) => { const u = uJson(e.pubkey), tgt = [...e.tags].reverse().find((t) => t[0] === 'e')?.[1];
-        const type = e.kind === 7 ? 'like' : e.kind === 6 ? 'repost' : e.kind === 3 ? 'follow' : tgt ? 'reply' : 'mention';
-        return { type, post_id: e.kind === 1 ? e.id : tgt, is_read: 1, ts: e.created_at, handle: u.handle, name: u.name, avatar: u.avatar, excerpt: e.kind === 1 ? e.content : '' }; });
+        const type = e.kind === 7 ? (rxEv(e) === '+' ? 'like' : 'react') : e.kind === 6 ? 'repost' : e.kind === 3 ? 'follow' : tgt ? 'reply' : 'mention';
+        return { type, post_id: e.kind === 1 ? e.id : tgt, is_read: 1, ts: e.created_at, handle: u.handle, name: u.name, avatar: u.avatar, emoji: e.kind === 7 ? rxEv(e) : '', excerpt: e.kind === 1 ? e.content : '' }; });
       return { items };
     }
     case 'convos': {
@@ -293,6 +346,18 @@ let CSRF = '', ME = null, seq = 0, searchTimer;
 const S = { q: '', tabs: { home: 'all', search: 'all', notif: 'all', prof: 'posts' }, editing: false, parent: null, pending: '' };
 const app = $('#app'), dlg = $('#dlg');
 
+/* ---------- リアクション選択ポップアップ ---------- */
+const rxPick = document.createElement('div'); rxPick.id = 'rx-pick'; rxPick.hidden = true; document.body.appendChild(rxPick);
+const closePicker = () => { rxPick.hidden = true; rxPick.dataset.id = ''; };
+function openPicker(btn, id) {
+  const mine = MYR.get(id) || new Map();
+  rxPick.innerHTML = RX_SET.map((x) => `<button class="${mine.has(x) ? 'on' : ''}" data-act="react" data-id="${id}" data-emoji="${x}" aria-label="${x}">${x}</button>`).join('');
+  rxPick.hidden = false; rxPick.dataset.id = id;
+  const r = btn.getBoundingClientRect(), w = rxPick.offsetWidth, h = rxPick.offsetHeight;
+  rxPick.style.left = Math.max(8, Math.min(r.left, window.innerWidth - w - 8)) + 'px';
+  rxPick.style.top = (r.top - h - 8 >= 8 ? r.top - h - 8 : r.bottom + 8) + 'px';
+}
+
 const post = (a, body) => api(a, { method: 'POST', body });
 
 /* ---------- 部品 ---------- */
@@ -301,20 +366,32 @@ const tabs = (g, items) => `<div class="tabs">${items.map(([k, l]) => `<button d
 const empty = (icon, title, text) => `<div class="empty"><i class="${icon}"></i><h2>${title}</h2><p>${text}</p></div>`;
 const list = (ps, e) => ps.length ? ps.map(postHtml).join('') : e;
 
+const rxFace = (x) => CEMOJI.has(x) ? `<img class="cemoji" src="${esc(CEMOJI.get(x))}" alt="${esc(x)}" title="${esc(x)}" loading="lazy" referrerpolicy="no-referrer">` : esc(x);
+const rxChips = (p) => { const ks = Object.keys(p.rx || {}).sort((a, b) => p.rx[b] - p.rx[a]); if (!ks.length) return '';
+  return `<div class="rx-list">${ks.map((x) => `<button class="rx-chip ${(p.myrx || []).includes(x) ? 'on' : ''}" data-act="react" data-id="${p.id}" data-emoji="${esc(x)}" aria-label="${esc(x)}でリアクション"><span>${rxFace(x)}</span><span class="n">${p.rx[x]}</span></button>`).join('')}</div>`; };
 function postHtml(p) {
   return `<article class="post" data-id="${p.id}"><a class="avatar" href="#/profile/${p.handle}">${av(p)}</a>
     <div class="content">
       <div class="header"><a class="name" href="#/profile/${p.handle}">${esc(p.name)}</a><span class="username">@${sh(p.handle)}</span><a class="time" href="#/post/${p.id}">· ${ago(p.ts)}</a>
         ${p.mine ? `<button class="btn-del" data-act="del" data-id="${p.id}" aria-label="削除"><i class="fa-regular fa-trash-can"></i></button>` : ''}</div>
-      <p class="text">${rich(p.body)}</p>${ogpSlot(p.body)}
+      <p class="text">${rich(p.body, p.emojis)}</p>${ogpSlot(p.body)}${rxChips(p)}
       <div class="actions">
         <button class="reply" data-act="reply" data-id="${p.id}" aria-label="返信"><i class="fa-regular fa-comment"></i><span>${p.rep}</span></button>
         <button class="repost ${p.reposted ? 'on' : ''}" data-act="rt" data-id="${p.id}" aria-label="リポスト"><i class="fa-solid fa-retweet"></i><span>${p.rt}</span></button>
         <button class="like ${p.liked ? 'on' : ''}" data-act="like" data-id="${p.id}" aria-label="いいね"><i class="fa-${p.liked ? 'solid' : 'regular'} fa-heart"></i><span>${p.likes}</span></button>
+        <button class="react ${(p.myrx || []).length ? 'on' : ''}" data-act="react-open" data-id="${p.id}" aria-label="リアクションを選ぶ"><i class="fa-regular fa-face-smile"></i></button>
         <button class="bookmark ${p.bookmarked ? 'on' : ''}" data-act="bm" data-id="${p.id}" aria-label="ブックマーク"><i class="fa-${p.bookmarked ? 'solid' : 'regular'} fa-bookmark"></i></button>
         <button class="share" data-act="share" data-id="${p.id}" aria-label="共有"><i class="fa-solid fa-arrow-up-from-bracket"></i></button>
       </div></div></article>`;
 }
+const VIEWERS_MAX = 12;
+const viewersHtml = (d) => {
+  const vs = d.viewers || [], more = vs.length - VIEWERS_MAX;
+  return `<div class="viewers"><span class="vlabel"><i class="fa-regular fa-eye"></i> 閲覧</span>`
+    + (vs.length ? `<div class="vlist">${vs.slice(0, VIEWERS_MAX).map((u) => `<a class="vw" href="#/profile/${u.handle}" title="${esc(u.name)}" aria-label="${esc(u.name)}">${av(u)}</a>`).join('')}</div>${more > 0 ? `<span class="vmore">+${more}</span>` : ''}<span class="vcount">${vs.length}人</span>`
+      : '<span class="vcount">まだ閲覧者はいません</span>')
+    + (d.canRecord ? `<button class="vtoggle" data-act="noview">${d.noview ? '閲覧の記録を再開' : '閲覧を記録しない'}</button>` : '') + '</div>';
+};
 const followBtn = (u) => u.mine ? '' : `<button class="btn ${u.following || u.is_following ? '' : 'dark'}" data-act="follow" data-handle="${u.handle}">${u.following || u.is_following ? 'フォロー中' : 'フォロー'}</button>`;
 const userRow = (u) => `<div class="row"><a class="avatar lg" href="#/profile/${u.handle}">${av(u)}</a>
   <div class="grow"><a href="#/profile/${u.handle}"><div class="nm">${esc(u.name)}</div><div class="hd">@${sh(u.handle)}</div></a><div class="bio">${rich(u.bio || '')}</div></div>${followBtn(u)}</div>`;
@@ -364,19 +441,19 @@ const V = {
     const box = `<div class="reply-box"><span class="avatar">${av(ME)}</span><div class="grow">
       <textarea id="rep-text" maxlength="280" placeholder="@${sh(p.handle)} さんに返信" aria-label="返信"></textarea>
       <div class="foot"><span id="rep-count">280</span><button class="btn blue" data-act="rep-send" data-id="${p.id}">返信</button></div></div></div>`;
-    return { title: 'ポスト', html: head('ポスト', '', p.parent_id ? `#/post/${p.parent_id}` : '#/home') + parentLink + postHtml(p) + box
+    return { title: 'ポスト', html: head('ポスト', '', p.parent_id ? `#/post/${p.parent_id}` : '#/home') + parentLink + postHtml(p) + viewersHtml(d) + box
       + (d.replies.length ? d.replies.map(postHtml).join('') : '<div class="row trend-meta">まだ返信はありません</div>') };
   },
   async followers(h) { return followList(h, 'followers'); },
   async following(h) { return followList(h, 'following'); },
   async notifications() {
     const d = await api('notifs');
-    const icon = { like: 'fa-solid fa-heart', repost: 'fa-solid fa-retweet', follow: 'fa-solid fa-user-plus', reply: 'fa-regular fa-comment', mention: 'fa-solid fa-at' };
+    const icon = { react: 'fa-regular fa-face-smile', like: 'fa-solid fa-heart', repost: 'fa-solid fa-retweet', follow: 'fa-solid fa-user-plus', reply: 'fa-regular fa-comment', mention: 'fa-solid fa-at' };
     const verb = { like: 'があなたのポストにいいねしました', repost: 'があなたのポストをリポストしました', follow: 'さんにフォローされました', reply: 'さんが返信しました', mention: 'さんがあなたをメンションしました' };
     const items = d.items.filter((n) => S.tabs.notif === 'all' || n.type === 'reply' || n.type === 'mention').map((n) =>
       `<div class="row notif ${n.is_read ? '' : 'unread'}"><div class="ico ${n.type === 'mention' ? 'reply' : n.type}"><i class="${icon[n.type]}"></i></div>
        <div class="grow"><div class="who"><a class="avatar" href="#/profile/${n.handle}">${av(n)}</a></div>
-       <div><a href="#/profile/${n.handle}"><b>${esc(n.name)}</b></a>${verb[n.type]}　<span class="when">${ago(n.ts)}</span></div>
+       <div><a href="#/profile/${n.handle}"><b>${esc(n.name)}</b></a>${n.type === 'react' ? `があなたのポストに${rxFace(n.emoji)}でリアクションしました` : verb[n.type]}　<span class="when">${ago(n.ts)}</span></div>
        ${n.excerpt ? `<a class="excerpt" href="#/post/${n.post_id}">${esc(n.excerpt)}</a>` : ''}</div></div>`).join('');
     return { title: '通知', html: head('通知') + tabs('notif', [['all', 'すべて'], ['mentions', 'メンション']]) + (items || empty('fa-regular fa-bell', '通知はありません', 'いいねや返信がここに表示されます')), after: () => setBadge(0) };
   },
@@ -441,6 +518,7 @@ async function renderCore(fresh) {
   try { v = await V[name](arg); }
   catch (e) { v = { title: 'エラー', html: head('エラー', '', '#/home') + empty('fa-regular fa-face-frown', '表示できません', esc(e.message)) }; }
   if (my !== seq) return;
+  closePicker();
   app.innerHTML = v.html;
   document.title = v.title + ' / ℕ';
   document.querySelectorAll('.sidebar .nav-item[data-route]').forEach((a) =>
@@ -517,6 +595,7 @@ async function sendDm() {
 
 /* ---------- イベント ---------- */
 document.addEventListener('click', async (e) => {
+  if (!e.target.closest('#rx-pick, [data-act="react-open"]')) closePicker();
   const tb = e.target.closest('[data-tab]');
   if (tb) { S.tabs[tb.dataset.tabgroup] = tb.dataset.tab; rerender(); return; }
   if (e.target.closest('[data-go]')) { location.hash = e.target.closest('[data-go]').dataset.go; return; }
@@ -533,6 +612,9 @@ document.addEventListener('click', async (e) => {
   try {
     switch (act) {
       case 'like': await post('like', { id }); rerender(); break;
+      case 'react-open': if (!rxPick.hidden && rxPick.dataset.id === id) closePicker(); else openPicker(b, id); break;
+      case 'react': closePicker(); await post('react', { id, emoji: b.dataset.emoji }); rerender(); break;
+      case 'noview': try { localStorage.setItem('n_noview', noView() ? '0' : '1'); } catch (_) {} rerender(); break;
       case 'rt': await post('repost', { id }); rerender(); break;
       case 'bm': { const d = await post('bookmark', { id }); toast(d.on ? 'ブックマークに追加しました' : 'ブックマークを解除しました'); rerender(); break; }
       case 'follow': await post('follow', { handle }); rerender(); loadTrends(); break;
@@ -618,9 +700,13 @@ document.addEventListener('keydown', (e) => {
 });
 
 // OGP画像の読み込み失敗時は画像だけ取り除く
-document.addEventListener('error', (e) => { const i = e.target; if (i.tagName === 'IMG' && i.closest('.ogp')) i.remove(); }, true);
+document.addEventListener('error', (e) => { const i = e.target; if (i.tagName === 'IMG' && i.classList.contains('cemoji')) { i.replaceWith(document.createTextNode(i.alt)); return; }
+   if (i.tagName === 'IMG' && i.closest('.ogp')) i.remove(); }, true);
 
-window.addEventListener('hashchange', () => render(true));
+window.addEventListener('hashchange', () => { closePicker(); render(true); });
+window.addEventListener('scroll', closePicker, { passive: true });
+window.addEventListener('resize', closePicker);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePicker(); });
 setInterval(() => { if (ME) api('me').then((d) => setBadge(d.unread)).catch(() => {}); }, 60000);
 boot().catch(() => {}).then(() => render(true));
 })();
