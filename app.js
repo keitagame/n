@@ -11,9 +11,22 @@ const trimUrl = (u) => {
   }
 };
 const linkText = (u) => { const t = u.replace(/^https?:\/\//, ''); return t.length > 32 ? t.slice(0, 31) + '…' : t; };
+// NIP-19 参照 (npub/nprofile/note/nevent/naddr)。nostr: 付き・@ 付き・裸のどれでも拾う
+const BECH_RE = /(^|[^A-Za-z0-9])(?:nostr:|@)?((?:npub|nprofile|note|nevent|naddr)1[02-9ac-hj-np-z]{20,})/g;
+const bechDecode = (b) => { try { return NT.nip19.decode(b); } catch (_) { return null; } };
+const mentionPks = (s) => { const r = []; for (const m of String(s || '').matchAll(BECH_RE)) { const d = bechDecode(m[2]); if (d && d.type === 'npub') r.push(d.data); else if (d && d.type === 'nprofile') r.push(d.data.pubkey); } return r; };
+const bechLink = (b) => {
+  const d = bechDecode(b); if (!d) return '';
+  if (d.type === 'npub' || d.type === 'nprofile') {
+    const pk = d.type === 'npub' ? d.data : d.data.pubkey, n = npubOf(pk), p = PROF.get(pk) || {};
+    return `<a href="#/profile/${n}">@${esc(p.display_name || p.name || n.slice(0, 10) + '…')}</a>`;
+  }
+  if (d.type === 'note' || d.type === 'nevent') return `<a href="#/post/${d.type === 'note' ? d.data : d.data.id}">引用ポスト</a>`;
+  return `<a href="https://njump.me/${b}" target="_blank" rel="noopener noreferrer nofollow ugc">${b.slice(0, 12)}…</a>`;
+};
 const richText = (s) => esc(s)
-  .replace(/nostr:(npub1[a-z0-9]{58})/g, (m, n) => `<a href="#/profile/${n}">@${n.slice(0, 10)}…</a>`)
-  .replace(/(^|\s)@([A-Za-z0-9_]{3,15})/g, '$1<a href="#/profile/$2">@$2</a>')
+  .replace(BECH_RE, (m, pre, b) => { const l = bechLink(b); return l ? pre + l : m; })
+  .replace(/(^|\s)@(?!npub1)([A-Za-z0-9_]{3,15})/g, '$1<a href="#/profile/$2">@$2</a>')
   .replace(/(^|\s)#([\p{L}\p{N}_]+)/gu, (m, p, t) => `${p}<a href="#/search/${encodeURIComponent('#' + t)}">#${t}</a>`);
 const emojify = (html, em) => em && Object.keys(em).length
   ? html.replace(/(<[^>]*>)|:([A-Za-z0-9_]{1,40}):/g, (m, tag, n) => tag ? tag : em[n] ? `<img class="cemoji" src="${esc(em[n])}" alt=":${n}:" title=":${n}:" loading="lazy" referrerpolicy="no-referrer">` : m)
@@ -153,12 +166,19 @@ const RX_SET = ['👍', '😂', '😮', '😢', '🔥', '🎉', '🙏', '👀'];
 const eTarget = (e) => [...e.tags].reverse().find((t) => t[0] === 'e')?.[1];
 const parentOf = (e) => { const t = e.tags.filter((x) => x[0] === 'e'); if (!t.length) return null; return (t.find((x) => x[3] === 'reply') || t[t.length - 1])[1]; };
 
+// kind 6/16 (リポスト) は本文が元イベントのJSON。検証できれば元ポストに展開し、kind 1 以外は表示対象から外す
+const asPost = (e) => {
+  if (e.kind === 1) return e;
+  if (e.kind === 6 || e.kind === 16) { try { const o = JSON.parse(e.content); if (o && o.kind === 1 && typeof o.content === 'string' && NT.verifyEvent(o)) return o; } catch (_) {} }
+  return null;
+};
 async function decorate(evs, order = 'desc') {
+  evs = evs.map(asPost).filter(Boolean);
   evs = [...new Map(evs.map((e) => [e.id, e])).values()].sort((a, b) => order === 'asc' ? a.created_at - b.created_at : b.created_at - a.created_at);
   evs.forEach((e) => EVC.set(e.id, e));
   if (!evs.length) return [];
   const ids = evs.map((e) => e.id);
-  const [, st] = await Promise.all([profiles(evs.map((e) => e.pubkey)), qf({ kinds: [1, 6, 7], '#e': ids, limit: 2000 })]);
+  const [, st] = await Promise.all([profiles([...evs.map((e) => e.pubkey), ...evs.flatMap((e) => mentionPks(e.content))]), qf({ kinds: [1, 6, 7], '#e': ids, limit: 2000 })]);
   const c = {}; const slot = (id) => (c[id] ||= { rep: 0, rt: 0, likes: 0, rx: {} }); const bump = (id, k) => { slot(id)[k]++; };
   const seenRx = new Set();
   for (const s of st) {
@@ -272,13 +292,14 @@ async function apiCore(a, { method = 'GET', body = {}, q = {} } = {}) {
       const [e] = await qf({ ids: [b.id] }); if (!e) throw new Error('ポストが見つかりません');
       const rs = (await qf({ kinds: [1], '#e': [b.id] })).filter((x) => parentOf(x) === b.id);
       const [[post], replies, viewers] = await Promise.all([decorate([e]), decorate(rs, 'asc'), loadViewers(e).catch(() => [])]);
+      if (!post) throw new Error('ポストが見つかりません');
       return { post, replies, viewers, canRecord: !!SK, noview: noView() };
     }
     case 'post': {
       const tags = []; const t = String(b.body);
       if (b.parent_id) { const pe = EVC.get(b.parent_id) || (await qf({ ids: [b.parent_id] }))[0]; tags.push(['e', b.parent_id, '', 'reply']); if (pe) tags.push(['p', pe.pubkey]); }
       for (const m of new Set(t.match(/#[\p{L}\p{N}_]+/gu) || [])) tags.push(['t', m.slice(1).toLowerCase()]);
-      for (const m of t.matchAll(/nostr:(npub1[a-z0-9]{58})/g)) { const p = pkOf(m[1]); if (p) tags.push(['p', p]); }
+      for (const p of new Set(mentionPks(t))) tags.push(['p', p]);
       return { id: (await pub(1, t, tags)).id };
     }
     case 'delete_post': await forget(1, b.id); return { ok: true };
