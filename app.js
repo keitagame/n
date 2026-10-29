@@ -446,7 +446,7 @@ function postHtml(p) {
         <button class="like ${p.liked ? 'on' : ''}" data-act="like" data-id="${p.id}" aria-label="いいね"><i class="fa-${p.liked ? 'solid' : 'regular'} fa-heart"></i><span>${p.likes}</span></button>
         <button class="react ${(p.myrx || []).length ? 'on' : ''}" data-act="react-open" data-id="${p.id}" aria-label="リアクションを選ぶ"><i class="fa-regular fa-face-smile"></i></button>
         <button class="bookmark ${p.bookmarked ? 'on' : ''}" data-act="bm" data-id="${p.id}" aria-label="ブックマーク"><i class="fa-${p.bookmarked ? 'solid' : 'regular'} fa-bookmark"></i></button>
-        <button class="share" data-act="share" data-id="${p.id}" aria-label="共有"><i class="fa-solid fa-arrow-up-from-bracket"></i></button>
+        <button class="zap" data-act="zap" data-id="${p.id}" data-handle="${p.handle}" aria-label="Zap"><i class="fa-solid fa-bolt"></i></button>
       </div></div></article>`;
 }
 const VIEWERS_MAX = 12;
@@ -658,6 +658,51 @@ async function sendDm() {
   await render(false);
 }
 
+/* ---------- Zap (NIP-57) ---------- */
+const lnurlDecode = (s) => {
+  const C = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'; s = s.toLowerCase();
+  let bits = 0, v = 0; const out = [];
+  for (const ch of s.slice(s.lastIndexOf('1') + 1, -6)) { v = (v << 5) | C.indexOf(ch); bits += 5; if (bits >= 8) { bits -= 8; out.push((v >> bits) & 255); } v &= (1 << bits) - 1; }
+  return new TextDecoder().decode(Uint8Array.from(out));
+};
+async function zap(id, handle) {
+  if (!PK) { toast('Zapするにはログインしてください'); return; }
+  const pk = pkOf(handle) || (EVC.get(id) || {}).pubkey;
+  if (!pk) { toast('投稿者を特定できません'); return; }
+  if (pk === PK) { toast('自分の投稿にはZapできません'); return; }
+  await profiles([pk]);
+  const pr = PROF.get(pk) || {};
+  let url = '';
+  try {
+    if (pr.lud16 && pr.lud16.includes('@')) { const [n, d] = pr.lud16.trim().split('@'); url = `https://${d}/.well-known/lnurlp/${encodeURIComponent(n)}`; }
+    else if (pr.lud06) url = lnurlDecode(pr.lud06.trim());
+  } catch (_) {}
+  if (!url) { toast('この人はLightningアドレスを設定していません'); return; }
+  const info = await fetch(url).then((r) => r.json()).catch(() => null);
+  if (!info || !info.callback) { toast('Zap情報を取得できませんでした'); return; }
+  const min = Math.ceil((info.minSendable || 1000) / 1000), max = Math.floor((info.maxSendable || 1e11) / 1000);
+  let def = 21; try { def = +localStorage.getItem('n_zap') || 21; } catch (_) {}
+  const input = prompt(`Zapするsats数 (${min}〜${max})`, Math.min(Math.max(def, min), max));
+  if (input === null) return;
+  const sats = Math.floor(+input);
+  if (!(sats >= min && sats <= max)) { toast(`${min}〜${max} satsで指定してください`); return; }
+  try { localStorage.setItem('n_zap', String(sats)); } catch (_) {}
+  const msats = sats * 1000;
+  let cb = `${info.callback}${info.callback.includes('?') ? '&' : '?'}amount=${msats}`;
+  if (info.allowsNostr && info.nostrPubkey) {
+    const req = await signEv(9734, '', [['relays', ...RELAYS.slice(0, 5)], ['amount', String(msats)], ['p', pk], ['e', id]]);
+    cb += `&nostr=${encodeURIComponent(JSON.stringify(req))}`;
+  }
+  const inv = await fetch(cb).then((r) => r.json()).catch(() => null);
+  if (!inv || !inv.pr) { toast((inv && inv.reason) || 'インボイスを取得できませんでした'); return; }
+  if (window.webln) {
+    try { await window.webln.enable(); await window.webln.sendPayment(inv.pr); toast(`⚡ ${sats} sats をZapしました`); return; }
+    catch (_) { /* 失敗時は下のフォールバックへ */ }
+  }
+  try { await navigator.clipboard.writeText(inv.pr); toast('インボイスをコピーしました。ウォレットで支払ってください'); } catch (_) { toast('ウォレットを開きます'); }
+  location.href = 'lightning:' + inv.pr;
+}
+
 /* ---------- イベント ---------- */
 document.addEventListener('click', async (e) => {
   if (!e.target.closest('#rx-pick, [data-act="react-open"]')) closePicker();
@@ -697,8 +742,7 @@ document.addEventListener('click', async (e) => {
         await post('post', { body, parent_id: S.parent });
         dlg.close(); toast('ポストしました'); rerender(); loadTrends(); break;
       }
-      case 'share':
-        navigator.clipboard.writeText(location.origin + location.pathname + '#/post/' + id).then(() => toast('リンクをコピーしました'), () => toast('コピーできませんでした')); break;
+      case 'zap': await zap(id, handle); break;
       case 'dm-send': await sendDm(); break;
       case 'edit': S.editing = true; rerender(); break;
       case 'edit-cancel': S.editing = false; rerender(); break;
