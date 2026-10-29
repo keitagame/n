@@ -89,7 +89,31 @@ const Prog = (() => {
 
 /* ===== ℕ : Nostr レイヤー (api.php の代替) ===== */
 const NT = window.NostrTools;
-const RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.nostr.band', 'wss://yabu.me'];
+//const RELAYS = ['wss://relay.damus.io', 'wss://nos.lol', 'wss://relay.nostr.band', 'wss://yabu.me'];
+const RELAYS = [
+  // 元のリスト
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.nostr.band',
+  'wss://yabu.me',
+
+  // --- 高高速・高稼働グローバルリレー ---
+  'wss://relay.primal.net',      // Primal公式。非常に高速
+  'wss://relay.snort.social',     // Snort公式
+  'wss://nostr.mom',             // 広く使われているパブリックリレー
+  'wss://offchain.pub',          // パブリックリレー
+
+  // --- 国内・日本語コンテンツメイン ---
+  'wss://relay.nostr.wirednet.jp', // WiredNetが運営する日本主力リレー
+  'wss://nostr.holybea.com',      // 長期稼働している日本の代表的リレー
+  'wss://r.koishi.hn',            // 日本語圏でよく使われるリレー
+  'wss://nostr.fedibird.com',     // Fedibird運営の安定リレー
+  'wss://relay.yozora.world',     // 日本語圏リレー
+
+  // --- プロフィール・検索特化 ---
+  'wss://purplepag.es',          // ユーザープロフィール情報(Kind 0)の検索用
+  'wss://user.kindpag.es'         // プロフィール・イベント取得用
+];
 const SEARCH_RELAYS = ['wss://relay.nostr.band'];
 const pool = new NT.SimplePool();
 const sh = (h) => (h && h.length > 16 ? h.slice(0, 10) + '…' + h.slice(-4) : h || '');
